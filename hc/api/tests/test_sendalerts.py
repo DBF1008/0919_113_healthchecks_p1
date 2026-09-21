@@ -195,3 +195,132 @@ class SendAlertsTestCase(BaseTestCase):
             # Check.get_status(), which reads Check.status. So we *must not*
             # clobber flip.owner.status.
             self.assertEqual(args[0].owner.status, "down")
+
+
+class ClaimFlipTestCase(BaseTestCase):
+    def _make_flip(self) -> Flip:
+        check = Check.objects.create(project=self.project, status="up")
+        check.last_ping = now()
+        check.save()
+        flip = Flip(owner=check, created=now())
+        flip.old_status = "down"
+        flip.new_status = "up"
+        flip.save()
+        return flip
+
+    def test_claim_next_flip_returns_none_when_empty(self) -> None:
+        self.assertIsNone(Command(stdout=Mock()).claim_next_flip())
+
+    @patch("hc.api.management.commands.sendalerts.statsd")
+    @patch("hc.api.management.commands.sendalerts.notify")
+    def test_claim_next_flip_marks_processed(
+        self, mock_notify: Mock, statsd: Mock
+    ) -> None:
+        flip = self._make_flip()
+
+        claimed = Command(stdout=Mock()).claim_next_flip()
+
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.id, flip.id)
+        claimed.refresh_from_db()
+        self.assertIsNotNone(claimed.processed)
+
+    @patch("hc.api.management.commands.sendalerts.statsd")
+    @patch("hc.api.management.commands.sendalerts.notify")
+    def test_claim_next_flip_is_exclusive(
+        self, mock_notify: Mock, statsd: Mock
+    ) -> None:
+        """Two sequential claims must never return the same flip."""
+
+        flip = self._make_flip()
+
+        cmd = Command(stdout=Mock())
+        first = cmd.claim_next_flip()
+        second = cmd.claim_next_flip()
+
+        self.assertEqual(first.id if first else None, flip.id)
+        self.assertIsNone(second)
+        # Exactly one flip, marked processed exactly once.
+        self.assertEqual(Flip.objects.filter(processed__isnull=True).count(), 0)
+
+    def test_claim_returns_none_when_racer_marked_it_first(self) -> None:
+        """Simulate the losing side of the TOCTOU race.
+
+        The caller picks an unprocessed flip, but a concurrent process marks it
+        processed before the conditional UPDATE. The UPDATE matches 0 rows, so
+        claim_next_flip() must return None instead of processing a flip already
+        owned by someone else.
+        """
+
+        flip = self._make_flip()
+        cmd = Command(stdout=Mock())
+
+        # Reproduce exactly the fallback branch's two statements, with a
+        # concurrent claim happening in between.
+        chosen = Flip.objects.filter(processed=None).order_by("id").first()
+        self.assertEqual(chosen.id, flip.id)
+
+        # Racer wins:
+        Flip.objects.filter(id=flip.id, processed=None).update(processed=now())
+
+        # Our conditional UPDATE now changes nothing:
+        num_updated = Flip.objects.filter(id=chosen.id, processed=None).update(
+            processed=now()
+        )
+        self.assertEqual(num_updated, 0)
+        self.assertIsNone(cmd.claim_next_flip())
+
+
+class GoingDownAtomicityTestCase(BaseTestCase):
+    def _make_due_check(self) -> Check:
+        check = Check.objects.create(project=self.project, status="up")
+        check.last_ping = now() - td(days=2)
+        check.alert_after = check.last_ping + td(days=1, hours=1)
+        check.save()
+        return check
+
+    def test_it_rolls_back_status_when_flip_save_fails(self) -> None:
+        """status=down and the Flip must commit together.
+
+        If Flip creation fails, the check's status/alert_after change must be
+        rolled back as well, so no "down" check exists without its Flip.
+        """
+
+        check = self._make_due_check()
+
+        with patch("hc.api.management.commands.sendalerts.Flip.save") as save:
+            save.side_effect = RuntimeError("boom")
+            with self.assertRaises(RuntimeError):
+                Command(stdout=Mock()).handle_going_down()
+
+        check.refresh_from_db()
+        self.assertEqual(check.status, "up")
+        self.assertIsNotNone(check.alert_after)
+        self.assertEqual(Flip.objects.count(), 0)
+
+    def test_loser_does_not_create_duplicate_flip(self) -> None:
+        """If the conditional UPDATE matches 0 rows, no Flip is created."""
+
+        check = self._make_due_check()
+
+        # Simulate another worker transitioning the check first:
+        Check.objects.filter(id=check.id).update(status="down", alert_after=None)
+
+        # handle_going_down re-reads the due set; the row is now excluded
+        # (status=down), so there is nothing to do and no duplicate Flip.
+        result = Command(stdout=Mock()).handle_going_down()
+        self.assertFalse(result)
+        self.assertEqual(Flip.objects.count(), 0)
+
+    def test_it_creates_status_and_flip_in_one_transition(self) -> None:
+        check = self._make_due_check()
+
+        Command(stdout=Mock()).handle_going_down()
+
+        check.refresh_from_db()
+        self.assertEqual(check.status, "down")
+        self.assertIsNone(check.alert_after)
+        flip = Flip.objects.get()
+        self.assertEqual(flip.owner_id, check.id)
+        self.assertEqual(flip.new_status, "down")
+        self.assertEqual(flip.old_status, "up")

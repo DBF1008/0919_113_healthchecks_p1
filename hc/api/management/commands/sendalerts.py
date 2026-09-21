@@ -12,7 +12,7 @@ from typing import Any
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
-from django.db import close_old_connections, connection
+from django.db import close_old_connections, connection, transaction
 from django.utils.timezone import now
 
 from hc.api.models import Check, Flip
@@ -86,6 +86,46 @@ class Command(BaseCommand):
             logger.error("Exception in notify", exc_info=exc)
             raise exc
 
+    def claim_next_flip(self) -> Flip | None:
+        """Atomically claim the oldest unprocessed flip.
+
+        Concurrent sendalerts processes must never claim the same flip.
+        On backends that support row-level locks we atomically pick and lock
+        an unprocessed flip with ``SELECT ... FOR UPDATE SKIP LOCKED`` inside a
+        short transaction; every other process simply skips the locked row.
+        On backends without row-level locks (SQLite) we fall back to a
+        conditional UPDATE, which is itself atomic.
+        """
+
+        qs = Flip.objects.filter(processed=None).order_by("id")
+        if connection.features.has_select_for_update:
+            with transaction.atomic():
+                qs = qs.select_for_update(
+                    skip_locked=connection.features.supports_select_for_update_skip_locked
+                )
+                flip = qs.first()
+                if flip is None:
+                    return None
+
+                Flip.objects.filter(id=flip.id, processed=None).update(processed=now())
+            flip.refresh_from_db()
+            return flip
+
+        # No FOR UPDATE support: claim with an atomic conditional UPDATE.
+        flip = qs.first()
+        if flip is None:
+            return None
+
+        num_updated = Flip.objects.filter(id=flip.id, processed=None).update(
+            processed=now()
+        )
+        if num_updated != 1:
+            # Another sendalerts process claimed it first.
+            return None
+
+        flip.refresh_from_db()
+        return flip
+
     def process_one_flip(self) -> bool:
         """Find unprocessed flip, send notifications.
 
@@ -100,18 +140,20 @@ class Command(BaseCommand):
         if not self.seats.acquire(timeout=1):
             return False  # Workers busy, main thread should wait a bit
 
-        flip = Flip.objects.filter(processed=None).first()
+        try:
+            flip = self.claim_next_flip()
+        except Exception:
+            self.seats.release()
+            raise
+
         if flip is None:
             self.seats.release()
-            return False  # No work found, main thread should wait a bit
-
-        # Mark the flip as processed:
-        q = Flip.objects.filter(id=flip.id, processed=None)
-        num_updated = q.update(processed=now())
-        if num_updated != 1:
-            self.seats.release()
-            # Nothing got updated: another sendalerts process got there first.
-            return True
+            # No work found, or another process claimed it first.
+            # Distinguish the two via a cheap existence check so the main loop
+            # knows whether to keep polling or back off.
+            if Flip.objects.filter(processed=None).exists():
+                return True
+            return False
 
         statsd.incr("hc.sendalerts.processFlip")
         f = self.executor.submit(notify, flip)
@@ -159,18 +201,29 @@ class Command(BaseCommand):
         # must be able to calculate precisely when the check's state flipped.
         assert flip_time
 
-        # Atomically update status
-        num_updated = q.update(alert_after=None, status="down")
-        if num_updated != 1:
-            # Nothing got updated: another worker process got there first.
-            return True
+        # Atomically flip the check and create its Flip in one transaction.
+        # If another worker got there first, the conditional UPDATE matches 0
+        # rows, we create no Flip, and the check is left exactly as that worker
+        # left it. Doing the UPDATE and INSERT in the same transaction also
+        # guarantees other sessions can never observe status="down" without the
+        # corresponding Flip (under READ COMMITTED), so sendalerts cannot miss
+        # the alert.
+        with transaction.atomic():
+            # The conditional UPDATE takes a row lock for its duration, so two
+            # sendalerts processes serialise here: exactly one UPDATE matches
+            # the row. Because the Flip INSERT is in the same transaction, other
+            # sessions cannot observe status="down" without the Flip.
+            num_updated = q.update(alert_after=None, status="down")
+            if num_updated != 1:
+                # Nothing got updated: another worker process got there first.
+                return True
 
-        flip = Flip(owner=check)
-        flip.created = flip_time
-        flip.old_status = old_status
-        flip.new_status = "down"
-        flip.reason = "timeout"
-        flip.save()
+            flip = Flip(owner=check)
+            flip.created = flip_time
+            flip.old_status = old_status
+            flip.new_status = "down"
+            flip.reason = "timeout"
+            flip.save()
 
         return True
 

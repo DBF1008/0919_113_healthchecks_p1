@@ -568,14 +568,13 @@ class Check(models.Model):
         if self.n_pings % 100 == 0:
             self.prune()
 
-    def prune(self, wait: bool = False) -> None:
-        """Remove old pings and notifications."""
+    def _prune_db(self, threshold: int) -> None:
+        """Delete old pings, notifications and flips from the database.
 
-        threshold = self.n_pings - self.project.owner_profile.ping_log_limit
-
-        # Remove ping bodies from object storage
-        if settings.S3_BUCKET:
-            remove_objects(str(self.code), threshold, wait=wait)
+        Runs on the caller's DB connection, so it joins any surrounding
+        transaction. All deletes are idempotent and can safely be retried by a
+        later prune run.
+        """
 
         # Remove ping objects from db
         self.ping_set.filter(n__lte=threshold).delete()
@@ -592,13 +591,41 @@ class Check(models.Model):
             # Delete flips older than the oldest retained ping *and*
             # older than 93 days. We need ~3 months of flips for calculating
             # downtime statistics. The precise requirement is
-            # "we need the current month and full two previous months of data".
-            # We could calculate this precisely, but 3*31 is close enough and
-            # much simpler.
+            # "we need the current month and full two previous months of
+            # data". We could calculate this precisely, but 3*31 is close
+            # enough and much simpler.
             flip_threshold = min(ping.created, now() - td(days=93))
             self.flip_set.filter(created__lt=flip_threshold).delete()
         except Ping.DoesNotExist:
             pass
+
+    def prune(self, wait: bool = False) -> None:
+        """Remove old pings, notifications and ping bodies.
+
+        The slow S3 API calls run on a background thread so a ping request is
+        not blocked, while the database deletes stay on this connection and
+        therefore join any surrounding transaction.
+
+        Coordination and compensation between S3 and the database:
+
+        * The object-storage delete is retried internally, and every deletion
+          is idempotent. Objects that ultimately fail to delete are reconciled
+          on the next prune run (every 100th ping, or via prunepingsslow),
+          which also covers the case where S3 was temporarily unavailable.
+        * If an object is removed from S3 but its Ping row survives (e.g. the
+          request transaction rolls back), get_object() treats the missing
+          object as "no body", and the next run cleans up again. Neither order
+          can produce dangling database references that surface to users.
+        """
+
+        threshold = self.n_pings - self.project.owner_profile.ping_log_limit
+
+        if settings.S3_BUCKET:
+            # Remove ping bodies from object storage in the background.
+            remove_objects(str(self.code), threshold, wait=wait)
+
+        # Remove ping objects, notifications and flips from the database.
+        self._prune_db(threshold)
 
     @property
     def visible_pings(self) -> QuerySet[Ping]:

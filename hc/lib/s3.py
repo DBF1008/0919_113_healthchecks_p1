@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from io import BytesIO
 from threading import Thread
 from uuid import UUID
@@ -112,9 +113,62 @@ def put_object(code: UUID, n: int, data: bytes) -> None:
             if e.code == "InternalError" and retries > 0:
                 retries -= 1
                 print(f"InternalError, retrying ({retries=})...")
+                time.sleep(0.5)
                 continue
 
             raise e
+        except (InvalidResponseError, HTTPError):
+            # Transient transport error (connection reset, read timeout, ...).
+            # The Ping row already exists with object_size set; retry the upload
+            # so we do not end up with a Ping pointing at a missing body.
+            if retries <= 0:
+                raise
+            retries -= 1
+            logger.exception("Transient error in put_object, retrying")
+            time.sleep(0.5)
+
+
+REMOVE_MAX_TRIES = 3
+
+
+def _remove_objects_once(code: UUID, upto_n: int) -> bool:
+    """Delete keys with n <= upto_n. Return True if fully successful."""
+
+    prefix = "%s/" % code
+    start_after = prefix + enc(upto_n + 1)
+    q = client().list_objects(settings.S3_BUCKET, prefix, start_after=start_after)
+    delete_objs = [DeleteObject(obj.object_name) for obj in q]
+    if not delete_objs:
+        return True
+
+    num_objs = len(delete_objs)
+    try:
+        with statsd.timer("hc.lib.s3.removeObjectsTime"):
+            errors = list(client().remove_objects(settings.S3_BUCKET, delete_objs))
+    except ReadTimeoutError:
+        logger.exception(
+            f"ReadTimeoutError while removing {num_objs} objects for {code}"
+        )
+        statsd.incr("hc.lib.s3.removeObjectsErrors")
+        return False
+    except (S3Error, InvalidResponseError, HTTPError):
+        # Transient transport/server errors: safe to retry.
+        logger.exception(f"Error while removing {num_objs} objects for {code}")
+        statsd.incr("hc.lib.s3.removeObjectsErrors")
+        return False
+
+    if errors:
+        for e in errors:
+            statsd.incr("hc.lib.s3.removeObjectsErrors")
+            logger.error(
+                "remove_objects error for %s: [%s] %s",
+                start_after,
+                e.code,
+                e.message,
+            )
+        return False
+
+    return True
 
 
 def _remove_objects(code: UUID, upto_n: int) -> None:
@@ -122,37 +176,35 @@ def _remove_objects(code: UUID, upto_n: int) -> None:
     if upto_n <= 0:
         return
 
-    prefix = "%s/" % code
-    start_after = prefix + enc(upto_n + 1)
-    q = client().list_objects(settings.S3_BUCKET, prefix, start_after=start_after)
-    delete_objs = [DeleteObject(obj.object_name) for obj in q]
-    if delete_objs:
-        num_objs = len(delete_objs)
-        try:
-            with statsd.timer("hc.lib.s3.removeObjectsTime"):
-                errors = client().remove_objects(settings.S3_BUCKET, delete_objs)
-                for e in errors:
-                    statsd.incr("hc.lib.s3.removeObjectsErrors")
-                    logger.error(
-                        "remove_objects error for %s: [%s] %s",
-                        start_after,
-                        e.code,
-                        e.message,
-                    )
-        except ReadTimeoutError:
-            logger.exception(
-                f"ReadTimeoutError while removing {num_objs} objects for {code}"
-            )
-            statsd.incr("hc.lib.s3.removeObjectsErrors")
+    for attempt in range(REMOVE_MAX_TRIES):
+        if _remove_objects_once(code, upto_n):
+            return
+
+        if attempt + 1 < REMOVE_MAX_TRIES:
+            # Linear backoff before retrying. Listing and deletion are
+            # idempotent, so a retry simply cleans up whatever remains.
+            time.sleep(attempt + 1)
+
+    # Give up for now. The caller prunes on every 100th ping, so the orphaned
+    # objects are picked up and compensated on a subsequent prune run.
+    logger.error(
+        "Giving up removing objects for %s up to n=%d after %d tries",
+        code,
+        upto_n,
+        REMOVE_MAX_TRIES,
+    )
 
 
 def remove_objects(check_code: str, upto_n: int, wait: bool = False) -> None:
     """Remove keys with n values below or equal to `upto_n`.
 
-    The S3 API calls can take seconds to complete,
-    therefore run the removal code on thread.
+    The S3 API calls can take seconds to complete, therefore the removal runs
+    on a thread. The function is synchronous in the sense that all retry and
+    compensation logic lives in `_remove_objects`; `wait` only controls whether
+    the caller joins the worker thread.
     """
-    t = Thread(target=_remove_objects, args=(check_code, upto_n))
+
+    t = Thread(target=_remove_objects, args=(check_code, upto_n), daemon=True)
     t.start()
     if wait:
         t.join()

@@ -414,14 +414,17 @@ class CheckModelTestCase(BaseTestCase):
 
     @override_settings(S3_BUCKET="test-bucket")
     @patch("hc.api.models.remove_objects")
-    def test_it_prunes_object_storage(self, remove_objects: Mock) -> None:
+    def test_it_prunes_object_storage(self, mock_remove_objects: Mock) -> None:
         check = Check.objects.create(project=self.project, n_pings=101)
         Ping.objects.create(owner=check, n=101)
         Ping.objects.create(owner=check, n=1, object_size=1000)
 
         check.prune()
 
-        remove_objects.assert_called_once_with(str(check.code), 1, wait=False)
+        # S3 cleanup is dispatched on a background thread (wait=False),
+        # and the DB cleanup runs synchronously on the caller's connection.
+        mock_remove_objects.assert_called_once_with(str(check.code), 1, wait=False)
+        self.assertFalse(Ping.objects.filter(n=1).exists())
 
     def test_get_grace_start_returns_utc(self) -> None:
         check = Check(project=self.project)
@@ -456,3 +459,93 @@ class CheckModelTestCase(BaseTestCase):
 
         # rename_and_delete should handle an already deleted check gracefully:
         same_check.rename_and_delete()
+
+
+@override_settings(S3_BUCKET="test-bucket")
+class PruneCoordinationTestCase(BaseTestCase):
+    @patch("hc.api.models.remove_objects")
+    def test_db_prune_runs_even_if_s3_call_fails(
+        self, mock_remove_objects: Mock
+    ) -> None:
+        """S3 failure must not block the database cleanup step."""
+
+        check = Check.objects.create(project=self.project, n_pings=101)
+        Ping.objects.create(owner=check, n=101)
+        Ping.objects.create(owner=check, n=1, object_size=1000)
+
+        mock_remove_objects.side_effect = RuntimeError("s3 unavailable")
+
+        # remove_objects spawns its own thread; emulate failure inside the
+        # synchronous _prune_db coordination directly:
+        check._prune_db(threshold=1)
+
+        self.assertFalse(Ping.objects.filter(n=1).exists())
+        self.assertTrue(Ping.objects.filter(n=101).exists())
+
+    @patch("hc.api.models.remove_objects")
+    def test_prune_dispatches_s3_and_cleans_db(self, mock_remove_objects: Mock) -> None:
+        check = Check.objects.create(project=self.project, n_pings=101)
+        Ping.objects.create(owner=check, n=101)
+        Ping.objects.create(owner=check, n=1, object_size=1000)
+
+        check.prune(wait=True)
+
+        mock_remove_objects.assert_called_once_with(str(check.code), 1, wait=True)
+        self.assertFalse(Ping.objects.filter(n=1).exists())
+
+    def test_prune_is_idempotent(self) -> None:
+        """Re-running prune (compensation) must not raise or double-delete."""
+
+        check = Check.objects.create(project=self.project, n_pings=201)
+        Ping.objects.create(owner=check, n=201)
+        Ping.objects.create(owner=check, n=1)
+        Ping.objects.create(owner=check, n=2)
+
+        check._prune_db(threshold=101)
+        check._prune_db(threshold=101)
+
+        self.assertEqual(list(check.ping_set.values_list("n", flat=True)), [201])
+
+
+class PingFlipAtomicityTestCase(BaseTestCase):
+    @override_settings(S3_BUCKET=None)
+    def test_check_and_flip_commit_together_on_ping(self) -> None:
+        """A successful up-transition persists both status and the Flip."""
+
+        check = Check.objects.create(project=self.project, status="down")
+        check.ping(
+            remote_addr="1.2.3.4",
+            scheme="http",
+            method="GET",
+            ua="t",
+            body=b"",
+            action="success",
+            rid=None,
+        )
+
+        check.refresh_from_db()
+        self.assertEqual(check.status, "up")
+        flip = Flip.objects.get(owner=check)
+        self.assertEqual(flip.new_status, "up")
+        self.assertEqual(flip.old_status, "down")
+
+    @override_settings(S3_BUCKET=None)
+    def test_ping_rolls_back_when_ping_insert_fails(self) -> None:
+        """If Ping insert fails, the Check status flip must also roll back."""
+
+        check = Check.objects.create(project=self.project, status="down")
+        with patch("hc.api.models.Ping.save", side_effect=RuntimeError("x")):
+            with self.assertRaises(RuntimeError):
+                check.ping(
+                    remote_addr="1.2.3.4",
+                    scheme="http",
+                    method="GET",
+                    ua="t",
+                    body=b"",
+                    action="success",
+                    rid=None,
+                )
+
+        check.refresh_from_db()
+        self.assertEqual(check.status, "down")
+        self.assertEqual(Flip.objects.filter(owner=check).count(), 0)

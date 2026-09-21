@@ -9,6 +9,7 @@ from typing import Any
 
 from django.conf import settings
 from django.core.mail import EmailMultiAlternatives as Message
+from django.core.mail import get_connection
 from django.template.loader import render_to_string as render
 
 
@@ -21,9 +22,12 @@ class EmailThread(Thread):
 
     def run(self) -> None:
         for attempt in range(0, self.MAX_TRIES):
+            # Use a fresh, explicitly managed connection for every attempt.
+            # Previously the connection was replaced with None on retry without
+            # closing the old one, leaking the underlying SMTP socket.
+            connection = get_connection(fail_silently=False)
             try:
-                # Make sure each retry creates a new connection:
-                self.message.connection = None
+                self.message.connection = connection
                 self.message.send()
                 # No exception--great! Return from the retry loop
                 return
@@ -35,6 +39,11 @@ class EmailThread(Thread):
 
                 # Wait 1s before retrying
                 time.sleep(1)
+            finally:
+                # Always close the connection used by this attempt so its
+                # SMTP socket is released even on failure/retry.
+                connection.close()
+                self.message.connection = None
 
 
 def make_message(
