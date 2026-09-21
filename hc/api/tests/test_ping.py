@@ -402,6 +402,22 @@ class PingTestCase(BaseTestCase):
         self.assertEqual(n, 1)
         self.assertEqual(data, b"a" * 101)
 
+    @override_settings(S3_BUCKET="test-bucket", PING_BODY_LIMIT=None)
+    @patch("hc.api.models.put_object")
+    def test_it_falls_back_to_inline_body_when_s3_upload_fails(
+        self, put_object: Mock
+    ) -> None:
+        put_object.side_effect = Exception("S3 is down")
+
+        r = self.client.post(self.url, b"a" * 101, content_type="text/plain")
+        self.assertEqual(r.status_code, 200)
+
+        # The body must not be lost: it should be stored inline instead
+        ping = Ping.objects.get()
+        self.assertIsNone(ping.object_size)
+        assert ping.body_raw
+        self.assertEqual(bytes(ping.body_raw), b"a" * 101)
+
     def test_log_endpoint_works(self) -> None:
         r = self.client.post(self.url + "/log", "hello", content_type="text/plain")
         self.assertEqual(r.status_code, 200)

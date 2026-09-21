@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import time
 from email.message import EmailMessage
 from email.utils import make_msgid
@@ -8,8 +9,11 @@ from threading import Thread
 from typing import Any
 
 from django.conf import settings
+from django.core.mail import get_connection
 from django.core.mail import EmailMultiAlternatives as Message
 from django.template.loader import render_to_string as render
+
+logger = logging.getLogger("hc")
 
 
 class EmailThread(Thread):
@@ -21,20 +25,30 @@ class EmailThread(Thread):
 
     def run(self) -> None:
         for attempt in range(0, self.MAX_TRIES):
+            # Use a fresh connection for every attempt, and always close it
+            # when the attempt finishes (whether it succeeded or failed).
+            # Simply setting message.connection = None dropped the reference
+            # to the previously used connection without closing it, leaking
+            # an SMTP socket on every retry.
+            connection = get_connection(fail_silently=False)
+            self.message.connection = connection
             try:
-                # Make sure each retry creates a new connection:
-                self.message.connection = None
                 self.message.send()
-                # No exception--great! Return from the retry loop
                 return
             except (SMTPServerDisconnected, SMTPDataError) as e:
                 if attempt + 1 == self.MAX_TRIES:
                     # This was the last attempt and it failed:
                     # re-raise the exception
-                    raise e
+                    raise
 
                 # Wait 1s before retrying
                 time.sleep(1)
+            finally:
+                try:
+                    connection.close()
+                except Exception:
+                    logger.exception("Error while closing SMTP connection")
+                self.message.connection = None
 
 
 def make_message(

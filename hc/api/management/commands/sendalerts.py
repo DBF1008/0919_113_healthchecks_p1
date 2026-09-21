@@ -12,7 +12,7 @@ from typing import Any
 
 from django.conf import settings
 from django.core.management.base import BaseCommand
-from django.db import close_old_connections, connection
+from django.db import close_old_connections, connection, transaction
 from django.utils.timezone import now
 
 from hc.api.models import Check, Flip
@@ -100,21 +100,54 @@ class Command(BaseCommand):
         if not self.seats.acquire(timeout=1):
             return False  # Workers busy, main thread should wait a bit
 
-        flip = Flip.objects.filter(processed=None).first()
-        if flip is None:
-            self.seats.release()
-            return False  # No work found, main thread should wait a bit
+        flip = None
+        try:
+            # Atomically pick and claim an unprocessed flip.
+            #
+            # SELECT ... FOR UPDATE SKIP LOCKED locks the row until the
+            # transaction commits, so other sendalerts processes/threads skip
+            # over this flip instead of racing to claim it. This replaces the
+            # old read-then-update sequence which was a TOCTOU race: two
+            # processes could read the same flip before either marked it.
+            with transaction.atomic():
+                qs = Flip.objects.select_for_update(skip_locked=True)
+                flip = qs.filter(processed=None).order_by("id").first()
+                if flip is None:
+                    return False  # No work found, main thread should wait a bit
 
-        # Mark the flip as processed:
-        q = Flip.objects.filter(id=flip.id, processed=None)
-        num_updated = q.update(processed=now())
-        if num_updated != 1:
-            self.seats.release()
-            # Nothing got updated: another sendalerts process got there first.
-            return True
+                processed_time = now()
+                num_updated = Flip.objects.filter(
+                    id=flip.id, processed=None
+                ).update(processed=processed_time)
+                if num_updated != 1:
+                    # Should be impossible while we hold the row lock, but keep
+                    # the defensive check in place.
+                    logger.warning(
+                        "Failed to claim flip %s (%s row(s) updated)",
+                        flip.id,
+                        num_updated,
+                    )
+                    return True
+
+                # Remember the claimed timestamp so we can restore it if the
+                # worker pool refuses the job.
+                flip.processed = processed_time
+        finally:
+            # The seat is released either in on_notify_done (if the job was
+            # submitted) or here (if there was no work / claim failed).
+            if flip is None or flip.processed is None:
+                self.seats.release()
 
         statsd.incr("hc.sendalerts.processFlip")
-        f = self.executor.submit(notify, flip)
+        try:
+            f = self.executor.submit(notify, flip)
+        except RuntimeError:
+            # executor.shutdown() was called (shutdown in progress). Un-claim
+            # the flip so a future run picks it up.
+            Flip.objects.filter(id=flip.id).update(processed=None)
+            self.seats.release()
+            return False
+
         f.add_done_callback(self.on_notify_done)
         return True
 
@@ -130,49 +163,65 @@ class Command(BaseCommand):
 
         """
 
-        q = Check.objects.filter(alert_after__lt=now()).exclude(status="down")
-        # Sort by alert_after, to avoid unnecessary sorting by id:
-        check = q.order_by("alert_after").first()
-        if check is None:
-            return False
+        # Everything from candidate selection through flip creation happens in
+        # one transaction while holding a row lock:
+        # - FOR UPDATE SKIP LOCKED makes concurrent sendalerts processes skip
+        #   checks already being handled by another process (TOCTOU fix).
+        # - The check row lock is the same lock Check.ping() takes via
+        #   select_for_update(), so a flip created by ping() is always visible
+        #   to us and vice versa (no "check is down but no flip" window).
+        # - The status update and the Flip insert commit atomically, so a crash
+        #   can never leave a down check without its flip.
+        with transaction.atomic():
+            q = (
+                Check.objects.select_for_update(skip_locked=True)
+                .filter(alert_after__lt=now())
+                .exclude(status="down")
+            )
+            # Sort by alert_after, to avoid unnecessary sorting by id:
+            check = q.order_by("alert_after").first()
+            if check is None:
+                return False
 
-        old_status = check.status
-        q = Check.objects.filter(id=check.id, status=old_status)
+            old_status = check.status
+            q = Check.objects.filter(id=check.id, status=old_status)
 
-        try:
-            status = check.get_status()
-        except Exception as e:
-            # Make sure we don't trip on this check again for an hour:
-            # Otherwise sendalerts may end up in a crash loop.
-            q.update(alert_after=now() + td(hours=1))
-            # Then re-raise the exception:
-            raise e
+            try:
+                status = check.get_status()
+            except Exception as e:
+                # Make sure we don't trip on this check again for an hour:
+                # Otherwise sendalerts may end up in a crash loop.
+                q.update(alert_after=now() + td(hours=1))
+                # Then re-raise the exception:
+                raise e
 
-        if status != "down":
-            # It is not down yet. Update alert_after
-            q.update(alert_after=check.going_down_after())
+            if status != "down":
+                # It is not down yet. Update alert_after
+                q.update(alert_after=check.going_down_after())
+                return True
+
+            flip_time = check.going_down_after()
+            # In theory, going_down_after() can return None, but:
+            # get_status() just reported status "down", so "going_down_after()"
+            # must be able to calculate precisely when the check's state
+            # flipped.
+            assert flip_time
+
+            # Atomically update status
+            num_updated = q.update(alert_after=None, status="down")
+            if num_updated != 1:
+                # Nothing got updated: another worker process got there first.
+                # (Unreachable with SKIP LOCKED, kept as a defensive guard.)
+                return True
+
+            flip = Flip(owner=check)
+            flip.created = flip_time
+            flip.old_status = old_status
+            flip.new_status = "down"
+            flip.reason = "timeout"
+            flip.save()
+
             return True
-
-        flip_time = check.going_down_after()
-        # In theory, going_down_after() can return None, but:
-        # get_status() just reported status "down", so "going_down_after()"
-        # must be able to calculate precisely when the check's state flipped.
-        assert flip_time
-
-        # Atomically update status
-        num_updated = q.update(alert_after=None, status="down")
-        if num_updated != 1:
-            # Nothing got updated: another worker process got there first.
-            return True
-
-        flip = Flip(owner=check)
-        flip.created = flip_time
-        flip.old_status = old_status
-        flip.new_status = "down"
-        flip.reason = "timeout"
-        flip.save()
-
-        return True
 
     def on_signal(self, signum: int, frame: FrameType | None) -> None:
         desc = signal.strsignal(signum)

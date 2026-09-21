@@ -423,6 +423,63 @@ class CheckModelTestCase(BaseTestCase):
 
         remove_objects.assert_called_once_with(str(check.code), 1, wait=False)
 
+    @override_settings(S3_BUCKET="test-bucket")
+    @patch("hc.api.models.remove_objects")
+    def test_it_keeps_rows_when_s3_delete_fails(
+        self, remove_objects: Mock
+    ) -> None:
+        check = Check.objects.create(project=self.project, n_pings=101)
+        Ping.objects.create(owner=check, n=101)
+        Ping.objects.create(owner=check, n=1, object_size=1000)
+        Ping.objects.create(owner=check, n=2, object_size=1000)
+
+        # S3 could not delete the object for ping n=2:
+        remove_objects.return_value = {2}
+
+        check.prune()
+
+        # n=1's object was deleted from S3, its row must be gone:
+        self.assertFalse(Ping.objects.filter(n=1).exists())
+        # n=2's object survives in S3, its row must be kept:
+        self.assertTrue(Ping.objects.filter(n=2).exists())
+
+    @override_settings(S3_BUCKET="test-bucket")
+    @patch("hc.api.models.remove_objects")
+    def test_it_deletes_all_rows_when_s3_delete_succeeds(
+        self, remove_objects: Mock
+    ) -> None:
+        check = Check.objects.create(project=self.project, n_pings=101)
+        Ping.objects.create(owner=check, n=101)
+        Ping.objects.create(owner=check, n=1, object_size=1000)
+
+        remove_objects.return_value = set()
+
+        check.prune()
+
+        self.assertFalse(Ping.objects.filter(n=1).exists())
+
+    @override_settings(S3_BUCKET="test-bucket")
+    @patch("hc.api.models.remove_objects")
+    def test_it_retries_prune_for_previously_kept_rows(
+        self, remove_objects: Mock
+    ) -> None:
+        check = Check.objects.create(project=self.project, n_pings=101)
+        Ping.objects.create(owner=check, n=101)
+        kept = Ping.objects.create(owner=check, n=2, object_size=1000)
+
+        # First run: S3 fails for n=2, the row is kept. Second run: success.
+        remove_objects.side_effect = [{2}, set()]
+
+        check.prune()
+        self.assertTrue(Ping.objects.filter(id=kept.id).exists())
+
+        # More pings arrived, the retention threshold moves forward and the
+        # next prune run retries the previously kept row:
+        Check.objects.filter(id=check.id).update(n_pings=102)
+        check.refresh_from_db()
+        check.prune()
+        self.assertFalse(Ping.objects.filter(id=kept.id).exists())
+
     def test_get_grace_start_returns_utc(self) -> None:
         check = Check(project=self.project)
         check.kind = "cron"

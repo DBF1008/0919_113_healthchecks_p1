@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import socket
 import uuid
 from collections.abc import Sequence
@@ -33,6 +34,8 @@ from hc.lib import emails
 from hc.lib.date import month_boundaries, seconds_in_month
 from hc.lib.s3 import GetObjectError, get_object, put_object, remove_objects
 from hc.lib.urls import absolute_reverse
+
+logger = logging.getLogger("hc")
 
 STATUSES = (("up", "Up"), ("down", "Down"), ("new", "New"), ("paused", "Paused"))
 DEFAULT_TIMEOUT = td(days=1)
@@ -562,7 +565,22 @@ class Check(models.Model):
         # Upload ping body to S3 outside the DB transaction, because this operation
         # can potentially take a long time:
         if ping.object_size:
-            put_object(self.code, ping.n, body)
+            try:
+                put_object(self.code, ping.n, body)
+            except Exception:
+                # Compensation path: the upload failed despite put_object's
+                # own retries. The Ping row was already committed with
+                # object_size set, which would make its body unreadable.
+                # Fall back to storing the body inline so no data is lost.
+                logger.exception(
+                    "S3 upload failed for check %s, ping %s; "
+                    "storing body inline",
+                    self.code,
+                    ping.n,
+                )
+                Ping.objects.filter(id=ping.id).update(
+                    object_size=None, body_raw=body
+                )
 
         # Every 100 received pings, prune old pings and notifications:
         if self.n_pings % 100 == 0:
@@ -573,32 +591,56 @@ class Check(models.Model):
 
         threshold = self.n_pings - self.project.owner_profile.ping_log_limit
 
-        # Remove ping bodies from object storage
+        # Coordinate object storage and database deletes to avoid dangling
+        # references:
+        # - Remove from S3 first (it has built-in retries).
+        # - Only delete Ping rows for objects that are confirmed gone from S3.
+        #   If S3 deletion failed for an object, keep its Ping row; the object
+        #   stays reachable and a later prune run retries the cleanup.
+        # - DB deletes run inside a transaction, so a failure rolls back and the
+        #   next prune run retries (orphaned S3 objects are cleaned up
+        #   eventually, which is harmless).
         if settings.S3_BUCKET:
-            remove_objects(str(self.code), threshold, wait=wait)
+            failed_ns = remove_objects(str(self.code), threshold, wait=wait)
+            if failed_ns:
+                logger.warning(
+                    "Keeping %d ping row(s) for check %s due to object "
+                    "storage deletion failures: %s",
+                    len(failed_ns),
+                    self.code,
+                    sorted(failed_ns),
+                )
+                db_filter = self.ping_set.filter(
+                    n__lte=threshold
+                ).exclude(n__in=failed_ns)
+            else:
+                db_filter = self.ping_set.filter(n__lte=threshold)
+        else:
+            db_filter = self.ping_set.filter(n__lte=threshold)
 
-        # Remove ping objects from db
-        self.ping_set.filter(n__lte=threshold).delete()
+        with transaction.atomic():
+            # Remove ping objects from db
+            db_filter.delete()
 
-        try:
-            # Important: sort by "created", not by "id". Sorting by id
-            # may cause Postgres to use the "api_ping_pkey" index, and scan
-            # a huge number of rows.
-            ping = self.ping_set.earliest("created")
+            try:
+                # Important: sort by "created", not by "id". Sorting by id
+                # may cause Postgres to use the "api_ping_pkey" index, and scan
+                # a huge number of rows.
+                ping = self.ping_set.earliest("created")
 
-            # Delete notifications older than the oldest retained ping
-            self.notification_set.filter(created__lt=ping.created).delete()
+                # Delete notifications older than the oldest retained ping
+                self.notification_set.filter(created__lt=ping.created).delete()
 
-            # Delete flips older than the oldest retained ping *and*
-            # older than 93 days. We need ~3 months of flips for calculating
-            # downtime statistics. The precise requirement is
-            # "we need the current month and full two previous months of data".
-            # We could calculate this precisely, but 3*31 is close enough and
-            # much simpler.
-            flip_threshold = min(ping.created, now() - td(days=93))
-            self.flip_set.filter(created__lt=flip_threshold).delete()
-        except Ping.DoesNotExist:
-            pass
+                # Delete flips older than the oldest retained ping *and*
+                # older than 93 days. We need ~3 months of flips for calculating
+                # downtime statistics. The precise requirement is
+                # "we need the current month and full two previous months of
+                # data". We could calculate this precisely, but 3*31 is close
+                # enough and much simpler.
+                flip_threshold = min(ping.created, now() - td(days=93))
+                self.flip_set.filter(created__lt=flip_threshold).delete()
+            except Ping.DoesNotExist:
+                pass
 
     @property
     def visible_pings(self) -> QuerySet[Ping]:

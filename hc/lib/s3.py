@@ -1,8 +1,8 @@
 from __future__ import annotations
 
 import logging
+import time
 from io import BytesIO
-from threading import Thread
 from uuid import UUID
 
 from django.conf import settings
@@ -107,52 +107,156 @@ def put_object(code: UUID, n: int, data: bytes) -> None:
     while True:
         try:
             client().put_object(settings.S3_BUCKET, key, BytesIO(data), len(data))
-            break
-        except S3Error as e:
-            if e.code == "InternalError" and retries > 0:
-                retries -= 1
-                print(f"InternalError, retrying ({retries=})...")
-                continue
+            return
+        except (S3Error, InvalidResponseError, HTTPError) as e:
+            if isinstance(e, S3Error) and e.code != "InternalError":
+                raise e
+            if retries == 0:
+                raise e
+            retries -= 1
+            logger.warning(
+                "%s while uploading %s, retrying (%d retries left)",
+                e.__class__.__name__,
+                key,
+                retries,
+            )
+            time.sleep(1)
 
-            raise e
+
+def _decode_key_n(object_name: str) -> int | None:
+    """Extract the ping n value from an object key.
+
+    Keys have the form "<check-code>/<encoded-prefix>-<n>". Returns None if
+    the key does not end in an integer.
+    """
+    try:
+        return int(object_name.rsplit("-", 1)[1])
+    except (IndexError, ValueError):
+        return None
 
 
-def _remove_objects(code: UUID, upto_n: int) -> None:
+def _remove_objects_once(
+    code: UUID, upto_n: int, targets: list[str] | None = None
+) -> tuple[set[int], bool]:
+    """Attempt one batch deletion of objects with n <= upto_n.
+
+    Returns a tuple (failed_ns, timed_out):
+    - failed_ns: n values of objects the S3 API reported per-object errors for
+    - timed_out: True if the whole batch hit a ReadTimeoutError (the caller
+      may re-list and retry because the outcome is unknown)
+    """
     assert settings.S3_BUCKET
     if upto_n <= 0:
-        return
+        return set(), False
 
     prefix = "%s/" % code
     start_after = prefix + enc(upto_n + 1)
-    q = client().list_objects(settings.S3_BUCKET, prefix, start_after=start_after)
-    delete_objs = [DeleteObject(obj.object_name) for obj in q]
-    if delete_objs:
-        num_objs = len(delete_objs)
-        try:
-            with statsd.timer("hc.lib.s3.removeObjectsTime"):
-                errors = client().remove_objects(settings.S3_BUCKET, delete_objs)
-                for e in errors:
-                    statsd.incr("hc.lib.s3.removeObjectsErrors")
-                    logger.error(
-                        "remove_objects error for %s: [%s] %s",
-                        start_after,
-                        e.code,
-                        e.message,
-                    )
-        except ReadTimeoutError:
-            logger.exception(
-                f"ReadTimeoutError while removing {num_objs} objects for {code}"
+    if targets is None:
+        q = client().list_objects(
+            settings.S3_BUCKET, prefix, start_after=start_after
+        )
+        delete_objs = [DeleteObject(obj.object_name) for obj in q]
+    else:
+        delete_objs = [DeleteObject(name) for name in targets]
+
+    if not delete_objs:
+        return set(), False
+
+    num_objs = len(delete_objs)
+    try:
+        with statsd.timer("hc.lib.s3.removeObjectsTime"):
+            errors = client().remove_objects(settings.S3_BUCKET, delete_objs)
+            failed: set[int] = set()
+            for e in errors:
+                statsd.incr("hc.lib.s3.removeObjectsErrors")
+                logger.error(
+                    "remove_objects error for %s: [%s] %s",
+                    start_after,
+                    e.code,
+                    e.message,
+                )
+                n_value = _decode_key_n(e.name)
+                if n_value is not None:
+                    failed.add(n_value)
+            return failed, False
+    except ReadTimeoutError:
+        logger.exception(
+            f"ReadTimeoutError while removing {num_objs} objects for {code}"
+        )
+        statsd.incr("hc.lib.s3.removeObjectsErrors")
+        return set(), True
+
+
+def _remove_objects(code: UUID, upto_n: int) -> set[int]:
+    """Remove keys with n values below or equal to `upto_n`, with retries.
+
+    Returns the set of n values which could not be deleted after all retries.
+    The caller keeps the corresponding DB Ping rows so no ping body ends up
+    referenced in the DB but missing from object storage.
+    """
+    assert settings.S3_BUCKET
+    if upto_n <= 0:
+        return set()
+
+    failed_ns, timed_out = _remove_objects_once(code, upto_n)
+    if not failed_ns and not timed_out:
+        return set()
+
+    prefix = "%s/" % code
+    max_attempts = 3
+    for attempt in range(2, max_attempts + 1):
+        time.sleep(1)
+        if timed_out:
+            # Outcome of the previous attempt is unknown: re-list and delete
+            # whatever is still present.
+            retry_failed, retry_timed_out = _remove_objects_once(code, upto_n)
+        elif failed_ns:
+            targets = [f"{prefix}{enc(n)}" for n in sorted(failed_ns)]
+            retry_failed, retry_timed_out = _remove_objects_once(
+                code, upto_n, targets=targets
             )
-            statsd.incr("hc.lib.s3.removeObjectsErrors")
+        else:
+            retry_failed, retry_timed_out = set(), False
+
+        # Objects that failed before and are not reported by this attempt are
+        # assumed gone; the new report is authoritative for what remains.
+        failed_ns, timed_out = retry_failed, retry_timed_out
+
+        if not failed_ns and not timed_out:
+            return set()
+
+    if timed_out:
+        # The final attempt timed out; we cannot identify which objects
+        # survived. Surviving objects are harmless orphans that a future
+        # prune run cleans up. Do not block the corresponding DB rows.
+        logger.error(
+            "remove_objects for %s still timing out after %d attempts",
+            code,
+            max_attempts,
+        )
+        return set()
+
+    logger.error(
+        "remove_objects for %s gave up on %d object(s): %s",
+        code,
+        len(failed_ns),
+        sorted(failed_ns),
+    )
+    return failed_ns
 
 
-def remove_objects(check_code: str, upto_n: int, wait: bool = False) -> None:
+def remove_objects(check_code: str, upto_n: int, wait: bool = False) -> set[int]:
     """Remove keys with n values below or equal to `upto_n`.
 
-    The S3 API calls can take seconds to complete,
-    therefore run the removal code on thread.
+    Runs synchronously so the caller can learn which objects failed deletion
+    and keep their DB rows. The API calls have their own timeout/retry logic.
+
+    The `wait` argument is accepted for backwards compatibility and has no
+    effect (the call always waits for the result).
+
+    Returns the set of n values which could not be deleted.
     """
-    t = Thread(target=_remove_objects, args=(check_code, upto_n))
-    t.start()
-    if wait:
-        t.join()
+    if not settings.S3_BUCKET:
+        return set()
+
+    return _remove_objects(check_code, upto_n)
